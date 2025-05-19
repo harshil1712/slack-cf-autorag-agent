@@ -1,5 +1,5 @@
-import { Agent, routeAgentRequest } from 'agents';
-import { tool, generateText } from 'ai';
+import { Agent, getAgentByName } from 'agents';
+import { tool, generateText, type Message, appendResponseMessages } from 'ai';
 import { z } from 'zod';
 import { env } from 'cloudflare:workers';
 import { openai, createOpenAI } from '@ai-sdk/openai';
@@ -19,60 +19,69 @@ const KnowledgeBaseTool = tool({
 	},
 });
 
-export class KnowledgeBaseAgent extends Agent<Env> {
+export class KnowledgeBaseAgent extends Agent<Env, Message[]> {
 	client: WebClient = new WebClient(env.SLACK_BOT_TOKEN);
 	openai = createOpenAI({ apiKey: env.OPENAI_API_KEY });
 
-	async onRequest(request: Request): Promise<Response> {
-		const method = request.method;
-		const body = (await request.json()) as { type: string; challenge: string; event: GenericMessageEvent | AppMentionEvent };
-
-		// Only POST requests are allowed
-		if (method !== 'POST') {
-			return new Response('Not found', { status: 404 });
-		}
-
-		// If the request is a URL verification, return the challenge
-		if (body.type === 'url_verification') {
-			return new Response(body.challenge, { status: 200 });
-		}
-
-		// If the request is not an event callback, return not found
-		if (body.type !== 'event_callback') {
-			return new Response('Not found', { status: 404 });
-		}
-
+	async chat(body: GenericMessageEvent | AppMentionEvent): Promise<Response> {
 		// Wait for the postAnswer function to complete
-		this.ctx.waitUntil(this.postAnswer(body.event));
+		this.ctx.waitUntil(this.postAnswer(body));
 
 		// Return a 200 response
 		return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
 	}
 
-	async answerQuestion(body: GenericMessageEvent | AppMentionEvent) {
+	async onStart(): Promise<void> {
+		// Initialize state as an empty array if it doesn't exist
+		if (!this.state) {
+			this.setState([]);
+		}
+	}
+
+	async answerQuestion(userText: string) {
 		// Make sure we have text to process
-		if (!body.text) {
+		if (!userText) {
 			console.log('No text in message, skipping');
 			return "I couldn't understand that message. Could you please rephrase?";
 		}
 
-		// Ensure we have a valid prompt string
-		const userText = typeof body.text === 'string' ? body.text : '';
+		// Append user message to history
+		this.setState([
+			...(Array.isArray(this.state) ? this.state : []),
+			{
+				id: crypto.randomUUID(),
+				role: 'user',
+				content: userText,
+			},
+		]);
 
-		const { text } = await generateText({
+		// Generate context-aware response
+		const { text, response } = await generateText({
 			model: openai('gpt-4o'),
 			system: `You are a Slackbot Support Assistant. You help users with their questions and issues. You have access to tools that retrieve information from the knowledge base.
 			Keep your responses concise and to the point.
 			`,
-			prompt: userText,
+			messages: Array.isArray(this.state) ? this.state : [],
 			tools: {
 				KnowledgeBaseTool,
 			},
 			maxSteps: 2,
 		});
 
+		const formattedResponse = text
+			? text.replace(/\[(.*?)\]\((.*?)\)/g, '<$2|$1>').replace(/\*\*/g, '*')
+			: "I'm sorry, I couldn't generate a response.";
+
+		// Add assistant response to history
+		this.setState(
+			appendResponseMessages({
+				messages: Array.isArray(this.state) ? this.state : [],
+				responseMessages: response.messages,
+			})
+		);
+
 		// Format the response for Slack
-		return text ? text.replace(/\[(.*?)\]\((.*?)\)/g, '<$2|$1>').replace(/\*\*/g, '*') : "I'm sorry, I couldn't generate a response.";
+		return formattedResponse;
 	}
 
 	async postAnswer(body: GenericMessageEvent | AppMentionEvent) {
@@ -84,9 +93,9 @@ export class KnowledgeBaseAgent extends Agent<Env> {
 
 		// Only process direct messages or mentions to avoid loops
 		if (body.type === 'app_mention' || body.type === 'message') {
-			console.log('Processing user message for', body.type);
 			try {
-				const response = await this.answerQuestion(body);
+				const userMessage = body.text || '';
+				const response = await this.answerQuestion(userMessage);
 
 				// Send response in thread if possible
 				await this.client.chat.postMessage({
@@ -108,9 +117,22 @@ export class KnowledgeBaseAgent extends Agent<Env> {
 
 export default {
 	async fetch(request, env, ctx): Promise<Response> {
-		return (
-			// Route the request to our agent or return 404 if not found
-			(await routeAgentRequest(request, env)) || new Response('Not found', { status: 404 })
-		);
+		const body = (await request.json()) as { type: string; challenge?: string; event: GenericMessageEvent | AppMentionEvent };
+
+		if (body.type === 'url_verification') {
+			return new Response(body.challenge, { status: 200 });
+		}
+
+		if (request.method !== 'POST') {
+			return new Response('Not found', { status: 404 });
+		}
+
+		if (body.type !== 'event_callback') {
+			return new Response('Not found', { status: 404 });
+		}
+
+		let threadId = body.event.thread_ts || body.event.ts;
+		let agent = await getAgentByName<Env, KnowledgeBaseAgent>(env.KnowledgeBaseAgent, threadId);
+		return await agent.chat(body.event);
 	},
 } satisfies ExportedHandler<Env>;
