@@ -2,8 +2,8 @@ import { Agent, getAgentByName } from 'agents';
 import { tool, generateText, type Message, appendResponseMessages } from 'ai';
 import { z } from 'zod';
 import { env } from 'cloudflare:workers';
-import { openai, createOpenAI } from '@ai-sdk/openai';
-import { type GenericMessageEvent, WebClient, AppMentionEvent } from '@slack/web-api';
+import { createOpenAI } from '@ai-sdk/openai';
+import { type GenericMessageEvent, WebClient, type AppMentionEvent } from '@slack/web-api';
 
 const KnowledgeBaseTool = tool({
 	description: "Search the knowledge base for an answer to the user's question",
@@ -20,17 +20,6 @@ const KnowledgeBaseTool = tool({
 });
 
 export class KnowledgeBaseAgent extends Agent<Env, Message[]> {
-	client: WebClient = new WebClient(env.SLACK_BOT_TOKEN);
-	openai = createOpenAI({ apiKey: env.OPENAI_API_KEY });
-
-	async chat(body: GenericMessageEvent | AppMentionEvent): Promise<Response> {
-		// Wait for the postAnswer function to complete
-		this.ctx.waitUntil(this.postAnswer(body));
-
-		// Return a 200 response
-		return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
-	}
-
 	async onStart(): Promise<void> {
 		// Initialize state as an empty array if it doesn't exist
 		if (!this.state) {
@@ -38,7 +27,15 @@ export class KnowledgeBaseAgent extends Agent<Env, Message[]> {
 		}
 	}
 
-	async answerQuestion(userText: string) {
+	async chat(body: GenericMessageEvent | AppMentionEvent): Promise<Response> {
+		// Wait for the postToSlack function to complete
+		this.ctx.waitUntil(this.postToSlack(body));
+
+		// Return a 200 response
+		return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
+	}
+
+	async callAi(userText: string) {
 		// Make sure we have text to process
 		if (!userText) {
 			console.log('No text in message, skipping');
@@ -54,7 +51,7 @@ export class KnowledgeBaseAgent extends Agent<Env, Message[]> {
 				content: userText,
 			},
 		]);
-
+		const openai = createOpenAI({ apiKey: env.OPENAI_API_KEY });
 		// Generate context-aware response
 		const { text, response } = await generateText({
 			model: openai('gpt-4o'),
@@ -84,7 +81,8 @@ export class KnowledgeBaseAgent extends Agent<Env, Message[]> {
 		return formattedResponse;
 	}
 
-	async postAnswer(body: GenericMessageEvent | AppMentionEvent) {
+	async postToSlack(body: GenericMessageEvent | AppMentionEvent) {
+		const client = new WebClient(env.SLACK_BOT_TOKEN);
 		// Skip messages from bots or from this bot itself
 		if (body.bot_profile || body.bot_id || body.subtype === 'message_changed') {
 			console.log('Skipping bot message');
@@ -95,10 +93,10 @@ export class KnowledgeBaseAgent extends Agent<Env, Message[]> {
 		if (body.type === 'app_mention' || body.type === 'message') {
 			try {
 				const userMessage = body.text || '';
-				const response = await this.answerQuestion(userMessage);
+				const response = await this.callAi(userMessage);
 
 				// Send response in thread if possible
-				await this.client.chat.postMessage({
+				await client.chat.postMessage({
 					channel: body.channel,
 					text: response,
 					// Add thread_ts if the message is in a thread to keep conversations organized
